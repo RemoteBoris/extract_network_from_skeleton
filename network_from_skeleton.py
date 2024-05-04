@@ -209,7 +209,7 @@ def graph_from_edges(edges: dict):
     nodes = list(set(nodes))
     graph = nx.MultiGraph()
     for index in range(len(nodes)):
-        graph.add_node(index, pos = tuple(nodes[index]))# rows and cols are swapped so that the graph uses the same axes than the initial array/image
+        graph.add_node(index, pos = tuple(nodes[index]))
     
     # adding edges to graph
     pos = nx.get_node_attributes(graph,'pos')
