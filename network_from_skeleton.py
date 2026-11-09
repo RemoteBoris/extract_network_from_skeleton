@@ -1,252 +1,338 @@
 """
-Module designed to extract a network (as networkx graph) from a skeletonized array (from scikit-image skeletonize function for instance).
-"""
-import numpy as np
-from shapely.geometry import LineString
-import networkx as nx
+Extract a network (networkx MultiGraph) from a skeletonized binary array.
 
-def network_from_skeleton(array: np.ndarray, axesswap = True):
-    """"
-    Return a weighted networkx graph from a binary array (0s and 1s), where 1s consist of a serie of connected 1pixel-wide lines (= medial axis/skeleton).
-    A good example input is the output array of skeletonize() function from scikit-image package (after transformation of True/False array to 1s and 0s array).
-    
+Designed for skeletons produced by ``skimage.morphology.skeletonize`` (or any
+equivalent thinning algorithm): a 2D array where 1s form a 1-pixel-wide set of
+connected lines and 0s are background.
+
+Main entry point
+----------------
+>>> from network_from_skeleton import network_from_skeleton
+>>> G = network_from_skeleton(skeleton_array)
+
+Nodes carry a ``pos = (x, y)`` attribute (matching the image when plotted)
+and a ``kind`` attribute among:
+
+* ``"end"``         — degree-1 node (line extremity),
+* ``"junction"``    — degree >= 3 node (branching point),
+* ``"subdivision"`` — degree-2 node kept only to encode exact pixel geometry
+  (e.g. around diagonal crossings); removable with ``simplify="topology"``.
+
+Edges carry a geometric ``weight`` (length of the pixel path, diagonal steps
+counted as sqrt(2)) and a ``geometry`` attribute (list of pixels forming the
+branch).
+"""
+
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import networkx as nx
+import numpy as np
+from numpy.typing import NDArray
+
+# 8-connectivity offsets: (di, dj)
+_NEIGHBOURS = [
+    (-1, 0), (1, 0), (0, -1), (0, 1),          # cross (distance 1)
+    (-1, -1), (-1, 1), (1, -1), (1, 1),        # diagonals (distance sqrt(2))
+]
+
+
+def _check_input(array: NDArray) -> None:
+    """Validate that the input is a non-empty 2D binary array."""
+    if not isinstance(array, np.ndarray):
+        raise TypeError(f"array must be a numpy ndarray, got {type(array).__name__}")
+    if array.ndim != 2:
+        raise ValueError(f"array must be 2D, got {array.ndim} dimensions")
+    if array.size == 0:
+        raise ValueError("array is empty")
+    unique = np.unique(array)
+    if not np.isin(unique, [0, 1]).all():
+        raise ValueError(f"array must be binary (0s and 1s only), found values {unique.tolist()}")
+
+
+def _node_mask(skeleton: NDArray) -> NDArray:
+    """
+    Vectorized detection of nodes and dead-ends.
+
+    A pixel is a "terminal" when its 8-connected neighbour count (restricted to
+    skeleton pixels) is not equal to 2.
+    """
+    h, w = skeleton.shape
+    padded = np.pad(skeleton.astype(np.uint8), 1)
+    neighbour_sum = np.zeros((h, w), dtype=np.int16)
+    for di, dj in _NEIGHBOURS:
+        # pixel (i, j) of the skeleton maps to padded (i+1, j+1);
+        # its neighbour (i+di, j+dj) maps to padded (i+1+di, j+1+dj).
+        neighbour_sum += padded[1 + di : 1 + di + h, 1 + dj : 1 + dj + w]
+    degree = np.where(skeleton > 0, neighbour_sum, 0)
+    return (degree != 2).astype(np.uint8)
+
+
+def _pop_component(start: tuple[int, int],
+                   skeleton: NDArray,
+                   visited: NDArray) -> list[tuple[int, int]]:
+    """Collect, in BFS order, every skeleton pixel of one connected component."""
+    h, w = skeleton.shape
+    queue = deque([start])
+    visited[start] = True
+    component: list[tuple[int, int]] = []
+    while queue:
+        i, j = queue.popleft()
+        component.append((i, j))
+        for di, dj in _NEIGHBOURS:
+            ni, nj = i + di, j + dj
+            if 0 <= ni < h and 0 <= nj < w and skeleton[ni, nj] and not visited[ni, nj]:
+                visited[ni, nj] = True
+                queue.append((ni, nj))
+    return component
+
+
+def _neighbours_of(pixel: tuple[int, int], h: int, w: int) -> list[tuple[int, int]]:
+    """All in-grid neighbours of a pixel (8-connectivity)."""
+    i, j = pixel
+    out = []
+    for di, dj in _NEIGHBOURS:
+        ni, nj = i + di, j + dj
+        if 0 <= ni < h and 0 <= nj < w:
+            out.append((ni, nj))
+    return out
+
+
+def _step_candidates(pixel: tuple[int, int],
+                     pixels: set[tuple[int, int]],
+                     h: int, w: int) -> list[tuple[int, int]]:
+    """
+    Skeleton neighbours of a pixel that are valid "next steps".
+
+    Diagonal pixels whose two adjacent cross-neighbours are also skeleton
+    pixels represent an ambiguous corner: they are excluded to prevent jumping
+    across an intersection.
+    """
+    i, j = pixel
+    result = []
+    for q in _neighbours_of(pixel, h, w):
+        if q not in pixels:
+            continue
+        di, dj = q[0] - i, q[1] - j
+        if abs(di) == 1 and abs(dj) == 1:
+            if (i + di, j) in pixels and (i, j + dj) in pixels:
+                continue  # ambiguous corner, handled via the cross step
+        result.append(q)
+    return result
+
+
+def _split_into_paths(component: list[tuple[int, int]],
+                      skeleton: NDArray) -> list[list[tuple[int, int]]]:
+    """
+    Decompose one connected component into maximal paths between terminals.
+
+    Each path is a list of consecutive pixels going from one terminal pixel
+    (dead-end or junction) to another. Pure cycles (no terminal at all) yield
+    one cyclic path.
+    """
+    pixels = set(component)
+    h, w = skeleton.shape
+    visited_edges: set[frozenset] = set()
+
+    def walk(start: tuple[int, int], first: tuple[int, int]) -> list[tuple[int, int]]:
+        """Follow one branch from a terminal pixel until the next terminal."""
+        path = [start, first]
+        visited_edges.add(frozenset((start, first)))
+        prev, cur = start, first
+        while True:
+            candidates = _step_candidates(cur, pixels, h, w)
+            if len(candidates) > 2:
+                break  # junction reached: its other branches get their own walks
+            nxt = [q for q in candidates
+                   if q != prev and frozenset((cur, q)) not in visited_edges]
+            if not nxt:
+                break  # dead end reached
+            prev, cur = cur, nxt[0]
+            path.append(cur)
+            visited_edges.add(frozenset((prev, cur)))
+        return path
+
+    terminals = [p for p in component if len(_step_candidates(p, pixels, h, w)) != 2]
+
+    paths: list[list[tuple[int, int]]] = []
+    for t in terminals:
+        for q in _step_candidates(t, pixels, h, w):
+            if frozenset((t, q)) not in visited_edges:
+                paths.append(walk(t, q))
+
+    # Whatever remains is made of pure cycles (no terminal pixels).
+    remaining = pixels - {p for path in paths for p in path}
+    while remaining:
+        start = min(remaining)
+        for q in _step_candidates(start, pixels, h, w):
+            if frozenset((start, q)) not in visited_edges:
+                path = walk(start, q)
+                if len(path) > 2:  # close the cycle if the walk came back
+                    for q2 in _step_candidates(path[-1], pixels, h, w):
+                        if q2 == start:
+                            path.append(start)
+                            visited_edges.add(frozenset((path[-2], start)))
+                paths.append(path)
+                remaining -= set(path)
+                break
+        else:
+            remaining.discard(start)
+
+    return paths
+
+
+def _simplify_geometry(path: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Drop intermediate collinear pixels from a pixel path."""
+    if len(path) <= 2:
+        return list(path)
+    keep = [path[0]]
+    for k in range(1, len(path) - 1):
+        di, dj = path[k][0] - keep[-1][0], path[k][1] - keep[-1][1]
+        dn, dm = path[k + 1][0] - path[k][0], path[k + 1][1] - path[k][1]
+        if (di, dj) != (dn, dm):
+            keep.append(path[k])
+    keep.append(path[-1])
+    return keep
+
+
+def _edges_from_paths(paths: list[list[tuple[int, int]]],
+                      keep_geometry: bool) -> list[dict]:
+    """Build edge records (start, end, geometry, length) from pixel paths."""
+    records = []
+    for path in paths:
+        if len(path) < 2:
+            continue
+        geo = _simplify_geometry(path) if keep_geometry else [path[0], path[-1]]
+        length = 0.0
+        for a, b in zip(path, path[1:]):
+            length += math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+        records.append({"start": path[0], "end": path[-1],
+                        "geometry": geo, "full_path": path,
+                        "weight": round(length, 3)})
+    return records
+
+
+def _swap_axes_records(records: list[dict]) -> list[dict]:
+    """Convert (row, col) pixel coordinates to (x, y) image coordinates."""
+    for rec in records:
+        rec["start"] = (rec["start"][1], rec["start"][0])
+        rec["end"] = (rec["end"][1], rec["end"][0])
+        rec["geometry"] = [(p[1], p[0]) for p in rec["geometry"]]
+        rec["full_path"] = [(p[1], p[0]) for p in rec["full_path"]]
+    return records
+
+
+def _graph_from_edges(records: list[dict]) -> nx.MultiGraph:
+    """Assemble the networkx MultiGraph from edge records."""
+    graph = nx.MultiGraph()
+    node_id: dict[tuple, int] = {}
+
+    def get_node(pixel: tuple) -> int:
+        if pixel not in node_id:
+            node_id[pixel] = len(node_id)
+            graph.add_node(node_id[pixel], pos=pixel)
+        return node_id[pixel]
+
+    for rec in records:
+        u, v = get_node(rec["start"]), get_node(rec["end"])
+        graph.add_edge(u, v, weight=rec["weight"], geometry=rec["geometry"])
+    return graph
+
+
+def _annotate_and_dissolve(graph: nx.MultiGraph,
+                           dissolve_subdivisions: bool) -> nx.MultiGraph:
+    def kinds(g: nx.MultiGraph) -> dict:
+        return {n: ("end" if d == 1 else "junction" if d >= 3 else "subdivision")
+                for n, d in g.degree()}
+
+    nx.set_node_attributes(graph, kinds(graph), "kind")
+    if not dissolve_subdivisions:
+        return graph
+
+    H = nx.MultiGraph(graph)
+    merged = True
+    while merged:
+        merged = False
+        for n in [x for x, d in H.degree() if d == 2]:
+            u, v = list(H.neighbors(n))
+            attrs_u = H.get_edge_data(u, n)
+            attrs_v = H.get_edge_data(n, v)
+            if not attrs_u or not attrs_v:
+                continue  # securite: arrete rather than crash
+            key_u = min(attrs_u, key=lambda k: attrs_u[k].get("weight", 1))
+            key_v = min(attrs_v, key=lambda k: attrs_v[k].get("weight", 1))
+            geo_u = attrs_u[key_u].get("geometry") or [H.nodes[u]["pos"], H.nodes[n]["pos"]]
+            geo_v = attrs_v[key_v].get("geometry") or [H.nodes[n]["pos"], H.nodes[v]["pos"]]
+            H.add_edge(u, v,
+                       weight=attrs_u[key_u].get("weight", 1) + attrs_v[key_v].get("weight", 1),
+                       geometry=geo_u[:-1] + geo_v)
+            H.remove_node(n)
+            merged = True
+            break
+    nx.set_node_attributes(H, kinds(H), "kind")
+    return H
+
+
+def network_from_skeleton(array: NDArray,
+                          axesswap: bool = True,
+                          keep_geometry: bool = True,
+                          simplify: str = "geometry") -> nx.MultiGraph:
+    """
+    Return a weighted networkx MultiGraph built from a skeleton array.
+
     Parameters
     ----------
     array : ndarray, 2D
-        skeleton array from wich to extract the network.
-    axesswap : bool, by default True
-        Swap axes.
-        Function is initially designed to extract a network from an array stemming from an image.
-        For the network coordinates (see pos attribute) to match the image, a swapping of axes is required.
-    
+        Binary skeleton array (1s = skeleton pixels, 0s = background), e.g.
+        the output of ``skimage.morphology.skeletonize``.
+    axesswap : bool, default True
+        If True, swap (row, col) to (x, y) so that node ``pos`` attributes
+        match image coordinates when plotted with matplotlib.
+    keep_geometry : bool, default True
+        Store the pixel path of each branch in the ``geometry`` edge attribute.
+    simplify : {"geometry", "topology", "none"}, default "geometry"
+        * ``"geometry"``  — drop collinear intermediate pixels from stored
+          geometries (weights always use the full path).
+        * ``"topology"``  — additionally dissolve degree-2 subdivision nodes:
+          every edge then connects an extremity or a junction only.
+        * ``"none"``      — keep raw geometries (one pixel per path step).
+
     Returns
     -------
-        graph : networkx.classes.multigraph.MultiGraph
-        
-    Examples
-    --------
-    >>> example = np.array([
-        [0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-        [0,1,0,1,1,1,0,0,1,1,1,0,0,0,0,0,0],
-        [0,1,1,1,0,0,1,0,1,0,1,0,0,0,0,0,0],
-        [1,0,1,0,0,0,0,1,1,1,1,0,0,0,0,0,0],
-        [0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0],
-        [0,0,1,0,0,0,1,0,0,0,1,0,1,0,1,0,0],
-        [0,0,1,0,0,0,1,0,0,0,1,0,0,1,1,0,0],
-        [0,1,1,1,1,1,1,1,1,1,1,0,1,0,1,0,0],
-        [1,0,1,0,0,0,0,0,0,0,0,1,0,0,1,0,0],
-        [1,0,1,0,0,1,0,0,0,0,0,0,0,0,0,0,0],
-        [1,0,1,1,0,1,0,0,1,1,1,0,0,0,0,0,0],
-        [0,1,0,0,1,1,1,1,0,0,0,1,0,0,1,1,1],
-        [0,1,0,1,0,1,0,0,1,0,0,0,1,1,0,0,1],
-        [0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,1,1],
-        [0,0,0,0,0,1,1,1,1,1,0,1,1,0,0,0,0],
-        [0,0,0,0,0,0,0,1,0,1,0,0,1,1,1,1,0],
-        [0,0,0,0,0,0,0,1,0,1,0,1,0,0,0,1,0],
-        [0,0,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1],
-    ])
-    >>> G = network_from_skeleton(example)
-    >>> pos = nx.get_node_attributes(G, 'pos')
-        fig, ax = plt.subplots()
-        plt.imshow(example, cmap=plt.cm.binary)
-        nx.draw_networkx_nodes(G, pos, node_size = 50, ax = ax)
-        nx.draw_networkx_edges(G, pos, edge_color = "red", ax = ax)
+    networkx.MultiGraph
+        Nodes carry ``pos = (x, y)`` and ``kind`` in
+        {"end", "junction", "subdivision"}; edges carry ``weight`` (geometric
+        length, diagonals = sqrt(2)) and ``geometry`` (pixel path).
 
+    Raises
+    ------
+    TypeError, ValueError
+        If the input is not a non-empty 2D binary numpy array.
     """
-    points, nodes = points_and_nodes_from_skeleton(array)
+    _check_input(array)
+
+    skeleton = array.astype(np.uint8)
+    if not skeleton.any():
+        return nx.MultiGraph()
+
+    visited = np.zeros_like(skeleton, dtype=bool)
+    records: list[dict] = []
+    h, w = skeleton.shape
+
+    for (i, j) in np.argwhere(skeleton > 0):
+        if visited[i, j]:
+            continue
+        component = _pop_component((i, j), skeleton, visited)
+        paths = _split_into_paths(component, skeleton)
+        records.extend(
+            _edges_from_paths(paths, keep_geometry=keep_geometry and simplify != "none")
+        )
+
     if axesswap:
-        points, nodes = [axes_swap(i) for i in [points, nodes]]
-    edges = edges_from_points_and_nodes(points, nodes)
-    graph = graph_from_edges(edges)
+        records = _swap_axes_records(records)
+
+    graph = _graph_from_edges(records)
+    graph = _annotate_and_dissolve(graph, dissolve_subdivisions=(simplify == "topology"))
     return graph
-
-def points_and_nodes_from_skeleton(array: np.ndarray):
-    """"
-    Return an ordered list of points and a list of nodes from a binary array (0s and 1s), where 1s consist of a serie of connected 1pixel-wide lines (= medial axis/skeleton).
-    A good example input is the output array of skeletonize() function from scikit-image package (after transformation of True/False array to 1s and 0s array).
-    """
-    if array.ndim != 2:
-        raise ValueError("array/skeleton must be 2D")
-    if set(list(array.reshape(array.size))) != {0, 1}:
-        raise ValueError("array must be binary (0s and 1s only)")
-        
-    # add a border of zeros so that every 1-pixel has neighboring pixels
-    array = np.pad(array, pad_width=1, mode='constant')
-    
-    points = []
-    nodes = []
-    nodes_to_do = []
-    to_avoid = []
-    nodes_and_its_connections = {}
-    
-    # count the number of ones. Process is finished once count = 0
-    array_as_list = list(array.reshape(array.size))
-    
-    while array_as_list.count(1) != 0:
-        # select an extremity (dead-end) as starting point
-        for i in range(1, array.shape[0]-1):
-            for j in range(1, array.shape[1]-1):
-                if (array[i, j] == 1) and (sum(window(array, i, j)) <= 2):
-                    row = i
-                    col = j
-                    break
-            if (array[i, j] == 1) and (sum(window(array, i, j)) <= 2):
-                break
-        
-        # get neighboring informations
-        cross_indexes, cross_values, diag_indexes, diag_values = neighbors_index_and_value(array, row, col)
-        
-        # the number of paths defines whether or not a node needs to be created
-        paths_number = sum([value == 1 for value in cross_values] + [value == 1 for value in diag_values])
-        
-        point = (row, col)
-        points.append(point)
-        array[point] = 999 # point done 
-        nodes.append(point)
-        nodes_and_its_connections[point] = [cross_indexes[i] for i in range(len(cross_indexes)) if cross_values[i] == 1] + [diag_indexes[i] for i in range(len(diag_indexes)) if diag_values[i] == 1]
-
-        while (paths_number != 0) or nodes_to_do:
-            if (paths_number == 0): # reached a dead-end, go back to a node not done yet
-                row, col = nodes_to_do[-1]
-                nodes_to_do = nodes_to_do[:-1]
-            else:
-                if paths_number > 1: # create a node
-                    nodes.append((row, col))
-                    nodes_to_do.append((row, col))
-                    nodes_and_its_connections[(row, col)] = [cross_indexes[i] for i in range(len(cross_indexes)) if cross_values[i] ==1] + [diag_indexes[i] for i in range(len(diag_indexes)) if diag_values[i] ==1]
-                    #remember neighbors that are part of another path than the one folowed here after
-                    to_avoid = [tuple(i) for i in np.array(cross_indexes)[cross_values == 1]]
-                
-                # go to next point
-                if any([value == 1 for value in cross_values]):
-                    relative_next_cell_position = np.argwhere(np.array(cross_values) == 1)[0][0]
-                    row, col = cross_indexes[relative_next_cell_position] 
-                else:
-                    relative_next_cell_position = np.argwhere(np.array(diag_values) == 1)[0][0]
-                    row, col = diag_indexes[relative_next_cell_position]
-            
-            array[point] = 999 # point done       
-            point = (row, col) # assign next point
-            points.append(point)
-            
-            # get neighboring informations
-            cross_indexes, cross_values, diag_indexes, diag_values = neighbors_index_and_value(array, row, col)
-         
-            # preventing corners to be confused with nodes
-            potential_pos_in_cross = np.array(cross_indexes)[cross_values != 0]
-            potential_pos_in_cross = [tuple(i) for i in potential_pos_in_cross]
-            potential_pos_in_diag = np.array(diag_indexes)[diag_values != 0]
-            potential_pos_in_diag = [tuple(i) for i in potential_pos_in_diag]
-            for i in potential_pos_in_cross:
-                for j in potential_pos_in_diag:
-                  dist = np.linalg.norm(np.array(i) - np.array(j))
-                  if dist == 1:
-                      diag_values[[i for i in range(len(diag_indexes)) if diag_indexes[i] == j][0]] = 0
-        
-            # avoid connecting a neighbor that is part of another path when the previous point was defined as a node
-            cross_values[[i for i in range(len(cross_indexes)) if cross_indexes[i] in to_avoid]] = 0
-            diag_values[[i for i in range(len(diag_indexes)) if diag_indexes[i] in to_avoid]] = 0
-            to_avoid = []
-            
-            # the number of paths defines whether or not a node needs to be created
-            paths_number = sum([value == 1 for value in cross_values]+[value == 1 for value in diag_values])
-            
-            # handle a line that would finish in a already defined node (forming a closed loop)
-            for position in cross_indexes + diag_indexes:
-                if position in nodes:
-                    if point in nodes_and_its_connections[position]:
-                        if not (is_a_in_x([point, position], points) or is_a_in_x([position, point], points)):
-                            points.append(position)
-                            if paths_number != 0:
-                                points.append(point)
-                                nodes.append(point)
-                                nodes_and_its_connections[point] = [cross_indexes[i] for i in range(len(cross_indexes)) if cross_values[i] ==1] + [diag_indexes[i] for i in range(len(diag_indexes)) if diag_values[i] ==1]
-                        
-        array[point] = 999 # point done
-        array_as_list = list(array.reshape(array.size))
-    
-    # remove effect of the added border on points and nodes
-    points = [(i[0]-1, i[1]-1) for i in points]
-    nodes = [(i[0]-1, i[1]-1) for i in nodes]
-    
-    return points, nodes
-
-def axes_swap(arg: list):
-    reversedd = [tuple(reversed(element)) for element in arg]
-    return reversedd
-
-def edges_from_points_and_nodes(points: list, nodes: list):
-    # create edges and stock them in a dict
-    edges = {}
-    reset_index = 0
-    for index in range(len(points)):
-        if points[index] in nodes:
-            dist = np.linalg.norm(np.array(points[index]) - np.array(points[index-1]))
-            if dist < 1.5 and points[index] != points[index-2]:
-                edge = points[reset_index : index+1]
-            else:
-                edge = points[reset_index : index]
-
-            if len(edge) > 1:
-                edges['edge' + str(len(edges))] = edge
-                
-            reset_index = index
-    # add last edge
-    edge = points[reset_index : ]
-    if len(edge) > 1:
-        edges['edge' + str(len(edges))] = edge
-        
-    return edges
-        
-def graph_from_edges(edges: dict):    
-    # retrieve nodes (this includes extremities) from edges
-    nodes = []
-    for key, value in edges.items():
-        nodes.append(value[0])
-        nodes.append(value[-1])
-    
-    # adding nodes to graph
-    nodes = list(set(nodes))
-    graph = nx.MultiGraph()
-    for index in range(len(nodes)):
-        graph.add_node(index, pos = tuple(nodes[index]))
-    
-    # adding edges to graph
-    pos = nx.get_node_attributes(graph,'pos')
-    for key, value in edges.items():
-        first_node = [k for k, v in pos.items() if v == value[0]][0]
-        last_node = [k for k, v in pos.items() if v == value[-1]][0]
-        try:
-            if first_node != last_node:
-                line = LineString(value)
-                graph.add_edge(first_node, last_node, weight= round(line.length))
-        except:
-            pass
-        
-    return graph
-
-def window(array, i, j, d = 1):
-    n = array[i-d:i+d+1, j-d:j+d+1].flatten()
-    return n
-
-def neighbors_index_and_value(array, row, col):
-    cross_indexes = [(row-1, col), (row, col+1), (row+1, col), (row, col-1)]
-    cross_values = np.array([array[index] for index in cross_indexes])
-    diag_indexes = [(row-1, col+1), (row+1, col+1), (row+1, col-1), (row-1, col-1)]
-    diag_values = np.array([array[index] for index in diag_indexes])
-    return cross_indexes, cross_values, diag_indexes, diag_values
-
-def is_a_in_x(a, x):
-    for i in range(len(x) - len(a) + 1):
-        if a == x[i:i+len(a)]: return True
-    return False
-
-def add_extremities_to_nodes(nodes: list, edges: dict):
-    # add edge extremities as nodes
-    for key, value in edges.items():
-        if value[0] not in nodes:
-            nodes.append(value[0])
-        if value[-1] not in nodes:
-            nodes.append(value[-1])
-    
-    return nodes
