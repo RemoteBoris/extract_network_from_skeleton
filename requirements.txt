@@ -1,5 +1,4 @@
-python==3.12.3
-numpy==1.26.4
-matplotlib==3.8.4
-shapely==2.0.3
-networkx==3.1
+numpy>=2
+matplotlib>=3.10
+shapely>=2.1
+networkx>=3.4
