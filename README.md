@@ -1,3 +1,6 @@
+# Note
+Initially written at a time before generative AI, and by a geographer rather than a computer scientist, this code worked very well for what it was asked to do. Today, AI allows us to improve its robustness and readability — a nice illustration of how the tools at our disposal keep evolving.
+
 # Extract network from skeleton
 Module designed to extract a network (as networkx graph, see [MultiGraph doc](https://networkx.org/documentation/stable/reference/classes/multigraph.html) ) from a skeletonized array (such as the output of scikit-image skeletonize function for instance, see [Skeletonize doc](https://scikit-image.org/docs/stable/auto_examples/edges/plot_skeleton.html) ). 
 Skeleton input being a binary array where zeros represent the background and ones represent a single-pixel wide skeleton.
